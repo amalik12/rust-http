@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
-    env,
+    env, mem,
+    num::NonZero,
     os::fd::{AsFd, FromRawFd, OwnedFd, RawFd},
     thread::sleep,
     time::Duration,
@@ -9,18 +10,21 @@ use std::{
 use chrono::Local;
 use nix::{
     errno::Errno,
-    fcntl::{Flock, OFlag, open, renameat},
-    libc::exit,
+    fcntl::{open, renameat, Flock, OFlag},
+    libc::{exit, sem_open, sem_post, sem_unlink, sem_wait},
     sys::{
         self,
+        mman::{mmap, shm_open, shm_unlink, MapFlags, ProtFlags},
         stat::Mode,
-        wait::{WaitPidFlag, WaitStatus, waitpid},
+        wait::{waitpid, WaitPidFlag, WaitStatus},
     },
-    unistd::{ForkResult, fork, read, unlink, write},
+    unistd::{fork, ftruncate, read, unlink, write, ForkResult},
 };
 use rand::Rng;
 
 const FILENAME: &str = "http.log";
+const CONFIG_NAME: &str = "/config_mem";
+const CONFIG_SEM_NAME: &str = "/config_sem";
 
 fn main() {
     println!("Hello!");
@@ -40,9 +44,76 @@ fn main() {
     }
 }
 
-fn run() {
-    let mut children = Vec::new();
+struct Config {
+    verbosity: u8,
+}
 
+fn run() {
+    let fd = shm_open(
+        CONFIG_NAME,
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+        Mode::S_IRUSR | Mode::S_IWUSR,
+    )
+    .expect("Failed to create shared memory");
+
+    ctrlc::set_handler(|| {
+        shm_unlink(CONFIG_NAME).expect("Failed to unlink shared memory");
+        unsafe {
+            exit(0);
+        }
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    ftruncate(&fd, mem::size_of::<Config>().try_into().unwrap())
+        .expect("Failed to truncate shared memory");
+
+    let config: &mut Config;
+    unsafe {
+        let map = mmap(
+            None,
+            NonZero::new(mem::size_of::<Config>()).unwrap(),
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_SHARED,
+            &fd,
+            0,
+        )
+        .expect("Failed memory map");
+
+        let sem_name = std::ffi::CString::new(CONFIG_SEM_NAME).expect("Failed to create CString");
+        let sem = sem_open(
+            sem_name.as_ptr(),
+            OFlag::O_CREAT.bits() | OFlag::O_EXCL.bits(),
+            Mode::S_IRUSR | Mode::S_IWUSR,
+            1,
+        );
+        if sem == nix::libc::SEM_FAILED {
+            shm_unlink(CONFIG_NAME).expect("Failed to unlink shared memory");
+            panic!("Failed to create semaphore");
+        }
+
+        let mut result = sem_wait(sem);
+        if result < 0 {
+            shm_unlink(CONFIG_NAME).expect("Failed to unlink shared memory");
+            panic!("Failed to wait on semaphore");
+        }
+
+        config = &mut *(map.as_ptr() as *mut Config);
+        config.verbosity = 1;
+
+        result = sem_post(sem);
+        if result < 0 {
+            shm_unlink(CONFIG_NAME).expect("Failed to unlink shared memory");
+            panic!("Failed to post semaphore");
+        }
+
+        result = sem_unlink(sem_name.as_ptr());
+        if result < 0 {
+            shm_unlink(CONFIG_NAME).expect("Failed to unlink shared memory");
+            panic!("Failed to unlink semaphore");
+        }
+    }
+
+    let mut children = Vec::new();
     for _ in 0..4 {
         match unsafe { fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
@@ -87,7 +158,7 @@ fn run() {
             output.clear();
         }
 
-        log("Hello, world!");
+        log(format!("{:#?}: Hello, world!", config.verbosity).as_str());
         sleep(Duration::from_secs(1));
     }
 }

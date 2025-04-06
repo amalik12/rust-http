@@ -20,7 +20,6 @@ use nix::{
     },
     unistd::{fork, ftruncate, read, unlink, write, ForkResult},
 };
-use rand::Rng;
 
 const FILENAME: &str = "http.log";
 const CONFIG_NAME: &str = "/config_mem";
@@ -30,16 +29,28 @@ fn main() {
     println!("Hello!");
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        println!("Usage: {} <run|count|rotate>", args[0]);
+        println!("Usage: {} <run|count|rotate|update_config>", args[0]);
         return;
     }
     match args[1].as_str() {
         "run" => run(),
         "count" => count(),
         "rotate" => rotate(),
+        "update_config" => update_config(args[2].parse::<u8>().expect("Failed to parse verbosity")),
         _ => {
-            println!("Usage: {} <run|count|rotate>", args[0]);
+            println!("Usage: {} <run|count|rotate|update_config>", args[0]);
             return;
+        }
+    }
+    match shm_unlink(CONFIG_NAME) {
+        Ok(_) => {}
+        Err(e) => eprintln!("Failed to unlink shared memory: {}", e),
+    }
+
+    unsafe {
+        match sem_unlink(std::ffi::CString::new(CONFIG_SEM_NAME).unwrap().as_ptr()) {
+            x if x >= 0 => {}
+            _ => eprintln!("Failed to unlink semaphore"),
         }
     }
 }
@@ -48,7 +59,19 @@ struct Config {
     verbosity: u8,
 }
 
-fn run() {
+fn init_config(mut config: &mut Config) {
+    match shm_unlink(CONFIG_NAME) {
+        Ok(_) => {}
+        Err(e) => eprintln!("Failed to unlink shared memory: {}", e),
+    }
+
+    unsafe {
+        match sem_unlink(std::ffi::CString::new(CONFIG_SEM_NAME).unwrap().as_ptr()) {
+            x if x >= 0 => {}
+            _ => eprintln!("Failed to unlink semaphore"),
+        }
+    }
+
     let fd = shm_open(
         CONFIG_NAME,
         OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
@@ -56,18 +79,9 @@ fn run() {
     )
     .expect("Failed to create shared memory");
 
-    ctrlc::set_handler(|| {
-        shm_unlink(CONFIG_NAME).expect("Failed to unlink shared memory");
-        unsafe {
-            exit(0);
-        }
-    })
-    .expect("Error setting Ctrl-C handler");
-
     ftruncate(&fd, mem::size_of::<Config>().try_into().unwrap())
         .expect("Failed to truncate shared memory");
 
-    let config: &mut Config;
     unsafe {
         let map = mmap(
             None,
@@ -105,13 +119,87 @@ fn run() {
             shm_unlink(CONFIG_NAME).expect("Failed to unlink shared memory");
             panic!("Failed to post semaphore");
         }
+    }
+}
 
-        result = sem_unlink(sem_name.as_ptr());
+fn update_config(new_verbosity: u8) {
+    let fd = shm_open(CONFIG_NAME, OFlag::O_RDWR, Mode::S_IRUSR | Mode::S_IWUSR)
+        .expect("Failed to create shared memory");
+
+    unsafe {
+        let map = mmap(
+            None,
+            NonZero::new(mem::size_of::<Config>()).unwrap(),
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_SHARED,
+            &fd,
+            0,
+        )
+        .expect("Failed memory map");
+
+        let sem_name = std::ffi::CString::new(CONFIG_SEM_NAME).expect("Failed to create CString");
+        let sem = sem_open(sem_name.as_ptr(), 0);
+        if sem == nix::libc::SEM_FAILED {
+            panic!("Failed to create semaphore");
+        }
+
+        let mut result = sem_wait(sem);
         if result < 0 {
-            shm_unlink(CONFIG_NAME).expect("Failed to unlink shared memory");
-            panic!("Failed to unlink semaphore");
+            panic!("Failed to wait on semaphore");
+        }
+        let config: &mut Config = &mut *(map.as_ptr() as *mut Config);
+        config.verbosity = new_verbosity;
+
+        result = sem_post(sem);
+        if result < 0 {
+            panic!("Failed to post semaphore");
         }
     }
+}
+
+fn watch_config() {
+    let fd = shm_open(CONFIG_NAME, OFlag::O_RDONLY | OFlag::O_EXCL, Mode::S_IRUSR)
+        .expect("Failed to create shared memory");
+
+    let config: &Config;
+    unsafe {
+        let map = mmap(
+            None,
+            NonZero::new(mem::size_of::<Config>()).unwrap(),
+            ProtFlags::PROT_READ,
+            MapFlags::MAP_SHARED,
+            &fd,
+            0,
+        )
+        .expect("Failed memory map");
+
+        let sem_name = std::ffi::CString::new(CONFIG_SEM_NAME).expect("Failed to create CString");
+        let sem = sem_open(sem_name.as_ptr(), 0);
+        if sem == nix::libc::SEM_FAILED {
+            panic!("Failed to create semaphore {}", Errno::last());
+        }
+
+        let mut result = sem_wait(sem);
+        if result < 0 {
+            panic!("Failed to wait on semaphore");
+        }
+
+        config = &*(map.as_ptr() as *mut Config);
+
+        result = sem_post(sem);
+        if result < 0 {
+            panic!("Failed to post semaphore");
+        }
+        loop {
+            println!("Config verbosity: {}", config.verbosity);
+            sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+fn run() {
+    let config = &mut Config { verbosity: 0 };
+    init_config(config);
 
     let mut children = Vec::new();
     for _ in 0..4 {
@@ -121,8 +209,7 @@ fn run() {
                 continue;
             }
             Ok(ForkResult::Child) => {
-                let num = rand::rng().random_range(2..=10);
-                sleep(Duration::from_secs(num));
+                watch_config();
                 unsafe {
                     exit(0);
                 }

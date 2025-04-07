@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     env, mem,
     num::NonZero,
-    os::fd::{AsFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
     thread::sleep,
     time::Duration,
 };
@@ -15,6 +15,9 @@ use nix::{
     sys::{
         self,
         mman::{mmap, shm_open, shm_unlink, MapFlags, ProtFlags},
+        socket::{
+            accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, SockaddrIn,
+        },
         stat::Mode,
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
@@ -157,7 +160,7 @@ fn update_config(new_verbosity: u8) {
     }
 }
 
-fn watch_config() {
+fn watch_config(conn: OwnedFd) {
     let fd = shm_open(CONFIG_NAME, OFlag::O_RDONLY | OFlag::O_EXCL, Mode::S_IRUSR)
         .expect("Failed to create shared memory");
 
@@ -190,9 +193,22 @@ fn watch_config() {
         if result < 0 {
             panic!("Failed to post semaphore");
         }
+
         loop {
-            println!("Config verbosity: {}", config.verbosity);
-            sleep(Duration::from_secs(1));
+            let mut buf: [u8; 1024] = [0; 1024];
+            match read(conn.as_raw_fd(), &mut buf) {
+                Ok(0) => {
+                    println!("Connection closed");
+                    break;
+                }
+                Ok(n) => {
+                    println!("Received: {}", String::from_utf8_lossy(&buf[..n]));
+                }
+                Err(e) => {
+                    eprintln!("Error reading from socket: {}", e);
+                    break;
+                }
+            };
         }
     }
 }
@@ -201,53 +217,62 @@ fn run() {
     let config = &mut Config { verbosity: 0 };
     init_config(config);
 
-    let mut children = Vec::new();
-    for _ in 0..4 {
+    let fd = socket(
+        AddressFamily::Inet,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )
+    .expect("Failed to create socket");
+    bind(fd.as_raw_fd(), &SockaddrIn::new(127, 0, 0, 1, 8080)).expect("Failed to bind socket");
+
+    listen(&fd, Backlog::new(128).unwrap()).expect("Failed to listen on socket");
+
+    loop {
+        let conn = unsafe {
+            OwnedFd::from_raw_fd(accept(fd.as_raw_fd()).expect("Failed to accept connection"))
+        };
         match unsafe { fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
-                children.push(child);
                 continue;
             }
             Ok(ForkResult::Child) => {
-                watch_config();
-                unsafe {
-                    exit(0);
-                }
+                watch_config(conn);
             }
             Err(_) => println!("Fork failed"),
         }
     }
 
-    let mut output = HashSet::new();
-    loop {
-        'block: {
-            for pid in &children {
-                match waitpid(*pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
-                    Ok(WaitStatus::Exited(child, status)) => {
-                        output.insert((child, status));
-                    }
-                    Ok(WaitStatus::StillAlive) => break 'block,
-                    Ok(WaitStatus::Signaled(child, ..)) | Ok(WaitStatus::Stopped(child, _)) => {
-                        panic!("Pid exited unexpectedly: {}", child)
-                    }
-                    Err(e) => {
-                        if e != Errno::ECHILD {
-                            println!("Error waiting for pid {}: {}", *pid, e)
-                        }
-                    }
-                    _ => panic!("Unexpected branch"),
-                }
-            }
-            for (pid, status) in &output {
-                println!("Process {} completed with status {}", pid, status)
-            }
-            children.clear();
-            output.clear();
-        }
+    // let mut output = HashSet::new();
+    // loop {
+    //     'block: {
+    //         for pid in &children {
+    //             match waitpid(*pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
+    //                 Ok(WaitStatus::Exited(child, status)) => {
+    //                     output.insert((child, status));
+    //                 }
+    //                 Ok(WaitStatus::StillAlive) => break 'block,
+    //                 Ok(WaitStatus::Signaled(child, ..)) | Ok(WaitStatus::Stopped(child, _)) => {
+    //                     panic!("Pid exited unexpectedly: {}", child)
+    //                 }
+    //                 Err(e) => {
+    //                     if e != Errno::ECHILD {
+    //                         println!("Error waiting for pid {}: {}", *pid, e)
+    //                     }
+    //                 }
+    //                 _ => panic!("Unexpected branch"),
+    //             }
+    //         }
+    //         for (pid, status) in &output {
+    //             println!("Process {} completed with status {}", pid, status)
+    //         }
+    //         children.clear();
+    //         output.clear();
+    //     }
 
-        log(format!("{:#?}: Hello, world!", config.verbosity).as_str());
-        sleep(Duration::from_secs(1));
-    }
+    //     log(format!("{:#?}: Hello, world!", config.verbosity).as_str());
+    //     sleep(Duration::from_secs(1));
+    // }
 }
 
 fn log(text: &str) {

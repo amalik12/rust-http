@@ -1,17 +1,15 @@
 use std::{
-    collections::HashSet,
     env, mem,
     num::NonZero,
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
-    thread::sleep,
-    time::Duration,
+    thread::{self},
 };
 
 use chrono::Local;
 use nix::{
     errno::Errno,
     fcntl::{open, renameat, Flock, OFlag},
-    libc::{exit, sem_open, sem_post, sem_unlink, sem_wait},
+    libc::{sem_open, sem_post, sem_unlink, sem_wait},
     sys::{
         self,
         mman::{mmap, shm_open, shm_unlink, MapFlags, ProtFlags},
@@ -19,9 +17,8 @@ use nix::{
             accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, SockaddrIn,
         },
         stat::Mode,
-        wait::{waitpid, WaitPidFlag, WaitStatus},
     },
-    unistd::{fork, ftruncate, read, unlink, write, ForkResult},
+    unistd::{ftruncate, read, unlink, write},
 };
 
 const FILENAME: &str = "http.log";
@@ -202,7 +199,10 @@ fn watch_config(conn: OwnedFd) {
                     break;
                 }
                 Ok(n) => {
-                    println!("Received: {}", String::from_utf8_lossy(&buf[..n]));
+                    let message = String::from_utf8_lossy(&buf[..n]);
+                    println!("Received: {}", message);
+                    log(&message, config.verbosity);
+                    write(&conn, b"Message received\n").expect("Failed to write to socket");
                 }
                 Err(e) => {
                     eprintln!("Error reading from socket: {}", e);
@@ -232,50 +232,13 @@ fn run() {
         let conn = unsafe {
             OwnedFd::from_raw_fd(accept(fd.as_raw_fd()).expect("Failed to accept connection"))
         };
-        match unsafe { fork() } {
-            Ok(ForkResult::Parent { child, .. }) => {
-                continue;
-            }
-            Ok(ForkResult::Child) => {
-                watch_config(conn);
-            }
-            Err(_) => println!("Fork failed"),
-        }
+        thread::spawn(|| {
+            watch_config(conn);
+        });
     }
-
-    // let mut output = HashSet::new();
-    // loop {
-    //     'block: {
-    //         for pid in &children {
-    //             match waitpid(*pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
-    //                 Ok(WaitStatus::Exited(child, status)) => {
-    //                     output.insert((child, status));
-    //                 }
-    //                 Ok(WaitStatus::StillAlive) => break 'block,
-    //                 Ok(WaitStatus::Signaled(child, ..)) | Ok(WaitStatus::Stopped(child, _)) => {
-    //                     panic!("Pid exited unexpectedly: {}", child)
-    //                 }
-    //                 Err(e) => {
-    //                     if e != Errno::ECHILD {
-    //                         println!("Error waiting for pid {}: {}", *pid, e)
-    //                     }
-    //                 }
-    //                 _ => panic!("Unexpected branch"),
-    //             }
-    //         }
-    //         for (pid, status) in &output {
-    //             println!("Process {} completed with status {}", pid, status)
-    //         }
-    //         children.clear();
-    //         output.clear();
-    //     }
-
-    //     log(format!("{:#?}: Hello, world!", config.verbosity).as_str());
-    //     sleep(Duration::from_secs(1));
-    // }
 }
 
-fn log(text: &str) {
+fn log(text: &str, verbosity: u8) {
     let fd = open(
         FILENAME,
         OFlag::O_APPEND | OFlag::O_CREAT | OFlag::O_WRONLY,
@@ -289,7 +252,9 @@ fn log(text: &str) {
 
     let mut full_text = Local::now().to_rfc3339();
     full_text.push(' ');
-    full_text.push_str(text);
+    full_text.push_str(verbosity.to_string().as_str());
+    full_text.push(' ');
+    full_text.push_str(text.trim());
     full_text.push('\n');
     write(lock.as_fd(), full_text.as_bytes()).expect("Failed to write to file");
 

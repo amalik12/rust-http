@@ -122,41 +122,6 @@ fn init_config(mut config: &mut Config) {
     }
 }
 
-fn update_config(new_verbosity: u8) {
-    let fd = shm_open(CONFIG_NAME, OFlag::O_RDWR, Mode::S_IRUSR | Mode::S_IWUSR)
-        .expect("Failed to create shared memory");
-
-    unsafe {
-        let map = mmap(
-            None,
-            NonZero::new(mem::size_of::<Config>()).unwrap(),
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_SHARED,
-            &fd,
-            0,
-        )
-        .expect("Failed memory map");
-
-        let sem_name = std::ffi::CString::new(CONFIG_SEM_NAME).expect("Failed to create CString");
-        let sem = sem_open(sem_name.as_ptr(), 0);
-        if sem == nix::libc::SEM_FAILED {
-            panic!("Failed to create semaphore");
-        }
-
-        let mut result = sem_wait(sem);
-        if result < 0 {
-            panic!("Failed to wait on semaphore");
-        }
-        let config: &mut Config = &mut *(map.as_ptr() as *mut Config);
-        config.verbosity = new_verbosity;
-
-        result = sem_post(sem);
-        if result < 0 {
-            panic!("Failed to post semaphore");
-        }
-    }
-}
-
 fn watch_config(conn: OwnedFd) {
     let fd = shm_open(CONFIG_NAME, OFlag::O_RDONLY | OFlag::O_EXCL, Mode::S_IRUSR)
         .expect("Failed to create shared memory");
@@ -213,6 +178,29 @@ fn watch_config(conn: OwnedFd) {
     }
 }
 
+fn log(text: &str, verbosity: u8) {
+    let fd = open(
+        FILENAME,
+        OFlag::O_APPEND | OFlag::O_CREAT | OFlag::O_WRONLY,
+        Mode::S_IRUSR | Mode::S_IWUSR,
+    )
+    .expect("Failed to open file");
+
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let lock =
+        Flock::lock(owned_fd, nix::fcntl::FlockArg::LockExclusive).expect("Failed to obtain lock");
+
+    let mut full_text = Local::now().to_rfc3339();
+    full_text.push(' ');
+    full_text.push_str(verbosity.to_string().as_str());
+    full_text.push(' ');
+    full_text.push_str(text.trim());
+    full_text.push('\n');
+    write(lock.as_fd(), full_text.as_bytes()).expect("Failed to write to file");
+
+    lock.unlock().expect("Failed to unlock");
+}
+
 fn run() {
     let config = &mut Config { verbosity: 0 };
     init_config(config);
@@ -236,29 +224,6 @@ fn run() {
             watch_config(conn);
         });
     }
-}
-
-fn log(text: &str, verbosity: u8) {
-    let fd = open(
-        FILENAME,
-        OFlag::O_APPEND | OFlag::O_CREAT | OFlag::O_WRONLY,
-        Mode::S_IRUSR | Mode::S_IWUSR,
-    )
-    .expect("Failed to open file");
-
-    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let lock =
-        Flock::lock(owned_fd, nix::fcntl::FlockArg::LockExclusive).expect("Failed to obtain lock");
-
-    let mut full_text = Local::now().to_rfc3339();
-    full_text.push(' ');
-    full_text.push_str(verbosity.to_string().as_str());
-    full_text.push(' ');
-    full_text.push_str(text.trim());
-    full_text.push('\n');
-    write(lock.as_fd(), full_text.as_bytes()).expect("Failed to write to file");
-
-    lock.unlock().expect("Failed to unlock");
 }
 
 fn rotate() {
@@ -307,4 +272,39 @@ fn count() {
     }
     lock.unlock().expect("Failed to unlock");
     println!("Number of lines: {count}");
+}
+
+fn update_config(new_verbosity: u8) {
+    let fd = shm_open(CONFIG_NAME, OFlag::O_RDWR, Mode::S_IRUSR | Mode::S_IWUSR)
+        .expect("Failed to create shared memory");
+
+    unsafe {
+        let map = mmap(
+            None,
+            NonZero::new(mem::size_of::<Config>()).unwrap(),
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_SHARED,
+            &fd,
+            0,
+        )
+        .expect("Failed memory map");
+
+        let sem_name = std::ffi::CString::new(CONFIG_SEM_NAME).expect("Failed to create CString");
+        let sem = sem_open(sem_name.as_ptr(), 0);
+        if sem == nix::libc::SEM_FAILED {
+            panic!("Failed to create semaphore");
+        }
+
+        let mut result = sem_wait(sem);
+        if result < 0 {
+            panic!("Failed to wait on semaphore");
+        }
+        let config: &mut Config = &mut *(map.as_ptr() as *mut Config);
+        config.verbosity = new_verbosity;
+
+        result = sem_post(sem);
+        if result < 0 {
+            panic!("Failed to post semaphore");
+        }
+    }
 }

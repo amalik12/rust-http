@@ -5,4 +5,4 @@ edition = "2021"
 
 [dependencies]
 chrono = "0.4.40"
-nix = { version = "0.29.0", features = ["fs", "process", "mman", "socket", "net"]}
+nix = { version = "0.29.0", features = ["fs", "process", "mman", "socket", "net", "signal"]}

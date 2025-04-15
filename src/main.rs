@@ -13,6 +13,7 @@ use nix::{
     sys::{
         self,
         mman::{mmap, shm_open, shm_unlink, MapFlags, ProtFlags},
+        signal::{sigaction, SigAction, SIGTERM, SIGINT},
         socket::{
             accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, SockaddrIn,
         },
@@ -42,17 +43,6 @@ fn main() {
             return;
         }
     }
-    match shm_unlink(CONFIG_NAME) {
-        Ok(_) => {}
-        Err(e) => eprintln!("Failed to unlink shared memory: {}", e),
-    }
-
-    unsafe {
-        match sem_unlink(std::ffi::CString::new(CONFIG_SEM_NAME).unwrap().as_ptr()) {
-            x if x >= 0 => {}
-            _ => eprintln!("Failed to unlink semaphore"),
-        }
-    }
 }
 
 struct Config {
@@ -60,18 +50,6 @@ struct Config {
 }
 
 fn init_config(mut config: &mut Config) {
-    match shm_unlink(CONFIG_NAME) {
-        Ok(_) => {}
-        Err(e) => eprintln!("Failed to unlink shared memory: {}", e),
-    }
-
-    unsafe {
-        match sem_unlink(std::ffi::CString::new(CONFIG_SEM_NAME).unwrap().as_ptr()) {
-            x if x >= 0 => {}
-            _ => eprintln!("Failed to unlink semaphore"),
-        }
-    }
-
     let fd = shm_open(
         CONFIG_NAME,
         OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
@@ -101,13 +79,11 @@ fn init_config(mut config: &mut Config) {
             1,
         );
         if sem == nix::libc::SEM_FAILED {
-            shm_unlink(CONFIG_NAME).expect("Failed to unlink shared memory");
             panic!("Failed to create semaphore");
         }
 
         let mut result = sem_wait(sem);
         if result < 0 {
-            shm_unlink(CONFIG_NAME).expect("Failed to unlink shared memory");
             panic!("Failed to wait on semaphore");
         }
 
@@ -116,7 +92,6 @@ fn init_config(mut config: &mut Config) {
 
         result = sem_post(sem);
         if result < 0 {
-            shm_unlink(CONFIG_NAME).expect("Failed to unlink shared memory");
             panic!("Failed to post semaphore");
         }
     }
@@ -201,9 +176,33 @@ fn log(text: &str, verbosity: u8) {
     lock.unlock().expect("Failed to unlock");
 }
 
+extern "C" fn handle_term(_signo: i32) {
+    match shm_unlink(CONFIG_NAME) {
+        Ok(_) => {}
+        _ => {}
+    }
+
+    unsafe {
+        match sem_unlink(std::ffi::CString::new(CONFIG_SEM_NAME).unwrap().as_ptr()) {
+            x if x >= 0 => {}
+            _ => {}
+        }
+    }
+}
+
 fn run() {
     let config = &mut Config { verbosity: 0 };
     init_config(config);
+
+    unsafe {
+        let handler = SigAction::new(
+            sys::signal::SigHandler::Handler(handle_term),
+            sys::signal::SaFlags::empty(),
+            sys::signal::SigSet::empty(),
+        );
+        sigaction(SIGTERM, &handler).expect("Failed to set signal handler");
+        sigaction(SIGINT, &handler).expect("Failed to set signal handler");
+    }
 
     let fd = socket(
         AddressFamily::Inet,

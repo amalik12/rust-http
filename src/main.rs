@@ -36,7 +36,7 @@ fn main() {
     }
     match args[1].as_str() {
         "run" => run(),
-        "count" => count(),
+        "count" => println!("Number of lines: {}", count()),
         "rotate" => rotate(),
         "update_config" => update_config(args[2].parse::<u8>().expect("Failed to parse verbosity")),
         _ => {
@@ -50,7 +50,7 @@ struct Config {
     verbosity: u8,
 }
 
-fn init_config(mut config: &mut Config) {
+fn init_config() {
     let fd = shm_open(
         CONFIG_NAME,
         OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
@@ -88,7 +88,7 @@ fn init_config(mut config: &mut Config) {
             panic!("Failed to wait on semaphore");
         }
 
-        config = &mut *(map.as_ptr() as *mut Config);
+        let config = &mut *(map.as_ptr() as *mut Config);
         config.verbosity = 1;
 
         result = sem_post(sem);
@@ -143,6 +143,9 @@ fn watch_config(conn: OwnedFd) {
                     let message = String::from_utf8_lossy(&buf[..n]);
                     println!("Received: {}", message);
                     log(&message, config.verbosity);
+                    if count() > 500 {
+                        rotate();
+                    }
                     write(&conn, b"Message received\n").expect("Failed to write to socket");
                 }
                 Err(e) => {
@@ -189,8 +192,7 @@ extern "C" fn handle_term(_signo: i32) {
 extern "C" fn ignore_term(_signo: i32) {}
 
 fn run() {
-    let config = &mut Config { verbosity: 0 };
-    init_config(config);
+    init_config();
 
     unsafe {
         let empty_handler = SigAction::new(
@@ -282,7 +284,7 @@ fn rotate() {
     }
 }
 
-fn count() {
+fn count() -> i32 {
     let fd: RawFd = open(FILENAME, OFlag::O_RDONLY, Mode::S_IRUSR | Mode::S_IWUSR)
         .expect("Failed to open file");
 
@@ -301,7 +303,7 @@ fn count() {
         output = read(fd, &mut buf).expect("Failed to read file");
     }
     lock.unlock().expect("Failed to unlock");
-    println!("Number of lines: {count}");
+    return count;
 }
 
 fn update_config(new_verbosity: u8) {

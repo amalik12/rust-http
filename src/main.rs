@@ -98,11 +98,10 @@ fn init_config() {
     }
 }
 
-fn watch_config(conn: OwnedFd) {
+fn read_config() -> *mut Config {
     let fd = shm_open(CONFIG_NAME, OFlag::O_RDONLY | OFlag::O_EXCL, Mode::S_IRUSR)
         .expect("Failed to create shared memory");
 
-    let config: &Config;
     unsafe {
         let map = mmap(
             None,
@@ -125,39 +124,100 @@ fn watch_config(conn: OwnedFd) {
             panic!("Failed to wait on semaphore");
         }
 
-        config = &*(map.as_ptr() as *mut Config);
+        let config = map.as_ptr() as *mut Config;
 
         result = sem_post(sem);
         if result < 0 {
             panic!("Failed to post semaphore");
         }
-
-        loop {
-            let mut buf: [u8; 1024] = [0; 1024];
-            match read(conn.as_raw_fd(), &mut buf) {
-                Ok(0) => {
-                    println!("Connection closed");
-                    break;
-                }
-                Ok(n) => {
-                    let message = String::from_utf8_lossy(&buf[..n]);
-                    println!("Received: {}", message);
-                    log(&message, config.verbosity);
-                    if count() > 500 {
-                        rotate();
-                    }
-                    write(&conn, b"Message received\n").expect("Failed to write to socket");
-                }
-                Err(e) => {
-                    eprintln!("Error reading from socket: {}", e);
-                    break;
-                }
-            };
-        }
+        return config;
     }
 }
 
-fn log(text: &str, verbosity: u8) {
+fn process_message(request: &Request) -> String {
+    let status_text = match request.status {
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "OK",
+    };
+
+    // Process the message and return a response
+    let response = format!(
+        "HTTP/1.1 {} {}\n\
+         Content-Type: application/json\n\
+         \n\
+         {{\n\
+         \"path\": \"{}\", \n\
+         \"status\": {}, \n\
+         \"timestamp\": \"{}\"\n\
+         }}\n",
+        request.status,
+        status_text,
+        request.path,
+        request.status,
+        Local::now().to_rfc3339()
+    );
+    println!("{}", response);
+    response
+}
+
+struct Request {
+    path: String,
+    status: u32,
+}
+
+fn parse_request(message: String) -> Request {
+    let mut request = Request {
+        path: String::default(),
+        status: 200,
+    };
+    match message.lines().next() {
+        Some(value) => {
+            request.path = value.trim().to_string();
+            println!("{}", value.to_string());
+            if !request.path.starts_with("GET") || !request.path.contains("/status") {
+                request.status = 404;
+            }
+        }
+        None => {
+            request.status = 400;
+        }
+    }
+    return request;
+}
+
+fn handle_connection(conn: OwnedFd) {
+    let config = unsafe { &*read_config() };
+
+    loop {
+        let mut buf: [u8; 1024] = [0; 1024];
+        match read(conn.as_raw_fd(), &mut buf) {
+            Ok(0) => {
+                println!("Connection closed");
+                break;
+            }
+            Ok(n) => {
+                let message = String::from_utf8_lossy(&buf[..n]).into_owned();
+                println!("Received: {}", message);
+
+                let request = parse_request(message);
+                let response = process_message(&request);
+                log(&request.path.replace("HTTP/1.1", ""), config.verbosity, request.status);
+                if count() > 500 {
+                    rotate();
+                }
+                write(&conn, response.as_bytes()).expect("Failed to write to socket");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Error reading from socket: {}", e);
+                break;
+            }
+        };
+    }
+}
+
+fn log(text: &str, verbosity: u8, status: u32) {
     let fd = open(
         FILENAME,
         OFlag::O_APPEND | OFlag::O_CREAT | OFlag::O_WRONLY,
@@ -171,9 +231,11 @@ fn log(text: &str, verbosity: u8) {
 
     let mut full_text = Local::now().to_rfc3339();
     full_text.push(' ');
-    full_text.push_str(verbosity.to_string().as_str());
+    full_text.push_str(&verbosity.to_string());
     full_text.push(' ');
     full_text.push_str(text.trim());
+    full_text.push(' ');
+    full_text.push_str(&status.to_string());
     full_text.push('\n');
     write(lock.as_fd(), full_text.as_bytes()).expect("Failed to write to file");
 
@@ -220,7 +282,7 @@ fn run() {
             Ok(conn_fd) => {
                 let conn = unsafe { OwnedFd::from_raw_fd(conn_fd.as_raw_fd()) };
                 thread::spawn(move || {
-                    watch_config(conn);
+                    handle_connection(conn);
                 });
             }
             Err(e) => {

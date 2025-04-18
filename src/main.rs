@@ -2,6 +2,7 @@ use std::{
     env, mem,
     num::NonZero,
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
+    process::exit,
     thread::{self},
 };
 
@@ -13,7 +14,7 @@ use nix::{
     sys::{
         self,
         mman::{mmap, shm_open, shm_unlink, MapFlags, ProtFlags},
-        signal::{sigaction, SigAction, SIGTERM, SIGINT},
+        signal::{sigaction, sigprocmask, SigAction, SigSet, SIGINT, SIGTERM},
         socket::{
             accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, SockaddrIn,
         },
@@ -177,31 +178,28 @@ fn log(text: &str, verbosity: u8) {
 }
 
 extern "C" fn handle_term(_signo: i32) {
-    match shm_unlink(CONFIG_NAME) {
-        Ok(_) => {}
-        _ => {}
-    }
+    let _ = shm_unlink(CONFIG_NAME);
 
     unsafe {
-        match sem_unlink(std::ffi::CString::new(CONFIG_SEM_NAME).unwrap().as_ptr()) {
-            x if x >= 0 => {}
-            _ => {}
-        }
+        sem_unlink(std::ffi::CString::new(CONFIG_SEM_NAME).unwrap().as_ptr());
     }
+    exit(0);
 }
+
+extern "C" fn ignore_term(_signo: i32) {}
 
 fn run() {
     let config = &mut Config { verbosity: 0 };
     init_config(config);
 
     unsafe {
-        let handler = SigAction::new(
-            sys::signal::SigHandler::Handler(handle_term),
+        let empty_handler = SigAction::new(
+            sys::signal::SigHandler::Handler(ignore_term),
             sys::signal::SaFlags::empty(),
             sys::signal::SigSet::empty(),
         );
-        sigaction(SIGTERM, &handler).expect("Failed to set signal handler");
-        sigaction(SIGINT, &handler).expect("Failed to set signal handler");
+        sigaction(SIGTERM, &empty_handler).expect("Failed to set signal handler");
+        sigaction(SIGINT, &empty_handler).expect("Failed to set signal handler");
     }
 
     let fd = socket(
@@ -216,12 +214,45 @@ fn run() {
     listen(&fd, Backlog::new(128).unwrap()).expect("Failed to listen on socket");
 
     loop {
-        let conn = unsafe {
-            OwnedFd::from_raw_fd(accept(fd.as_raw_fd()).expect("Failed to accept connection"))
-        };
-        thread::spawn(|| {
-            watch_config(conn);
-        });
+        match accept(fd.as_raw_fd()) {
+            Ok(conn_fd) => {
+                let conn = unsafe { OwnedFd::from_raw_fd(conn_fd.as_raw_fd()) };
+                thread::spawn(move || {
+                    watch_config(conn);
+                });
+            }
+            Err(e) => {
+                if e == Errno::EINTR {
+                    println!("\nNo longer acception new connections, press Ctrl+C to exit");
+                    let mut set = sys::signal::SigSet::empty();
+                    set.add(SIGINT);
+                    set.add(SIGTERM);
+                    let mut old_set: SigSet = SigSet::empty();
+                    sigprocmask(
+                        sys::signal::SigmaskHow::SIG_BLOCK,
+                        Some(&set),
+                        Some(&mut old_set),
+                    )
+                    .expect("Failed to block signals");
+
+                    unsafe {
+                        let handler = SigAction::new(
+                            sys::signal::SigHandler::Handler(handle_term),
+                            sys::signal::SaFlags::empty(),
+                            sys::signal::SigSet::empty(),
+                        );
+
+                        sigaction(SIGTERM, &handler).expect("Failed to set signal handler");
+                        sigaction(SIGINT, &handler).expect("Failed to set signal handler");
+                    }
+
+                    old_set.suspend().expect("Failed to suspend signals");
+                    sigprocmask(sys::signal::SigmaskHow::SIG_UNBLOCK, Some(&old_set), None)
+                        .expect("Failed to unblock signals");
+                }
+                eprintln!("Error accepting connection: {}", e);
+            }
+        }
     }
 }
 

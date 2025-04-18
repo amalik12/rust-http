@@ -223,7 +223,7 @@ fn run() {
             }
             Err(e) => {
                 if e == Errno::EINTR {
-                    println!("\nNo longer acception new connections, press Ctrl+C to exit");
+                    println!("\nNo longer accepting new connections, press Ctrl+C to exit");
                     let mut set = sys::signal::SigSet::empty();
                     set.add(SIGINT);
                     set.add(SIGTERM);

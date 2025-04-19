@@ -1,5 +1,11 @@
 use std::{
-    mem, num::NonZero, os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd}, process::exit, str::FromStr, sync::Arc, thread::{self}
+    mem,
+    num::NonZero,
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
+    process::exit,
+    str::FromStr,
+    sync::Arc,
+    thread::{self},
 };
 
 use chrono::Local;
@@ -28,21 +34,21 @@ struct Config {
     verbosity: u8,
 }
 
-struct Request {
-    method: Method,
-    path: String,
+pub struct Request {
+    pub method: Method,
+    pub path: String,
 }
 
-enum ResponseType {
+pub enum ResponseType {
     Text,
     Json,
     Html,
 }
 
-struct Response {
-    status: u32,
-    body: String,
-    response_type: ResponseType,
+pub struct Response {
+    pub status: u32,
+    pub body: String,
+    pub response_type: ResponseType,
 }
 
 impl Response {
@@ -53,28 +59,34 @@ impl Response {
             _ => "OK",
         };
 
+        let content_type = match self.response_type {
+            ResponseType::Text => "text/plain",
+            ResponseType::Json => "application/json",
+            ResponseType::Html => "text/html",
+        };
+
         // Process the message and return a response
         let response = format!(
             "HTTP/1.1 {} {}\n\
-         Content-Type: application/json\n\
-         \n\
-    {}\n",
-            self.status, status_text, self.body
+            {}\n\
+            \n\
+            {}\n",
+            self.status, status_text, content_type, self.body
         );
         println!("{}", response);
         response
     }
 }
 
-#[derive(EnumString)]
-enum Method {
+#[derive(Eq, Hash, PartialEq, EnumString, Clone, Debug)]
+pub enum Method {
     GET,
     PUT,
     POST,
     DELETE,
 }
 
-trait Server: Send + Sync + 'static {
+pub trait Server: Send + Sync + 'static {
     fn init_config() {
         let fd = shm_open(
             CONFIG_NAME,
@@ -230,7 +242,8 @@ trait Server: Send + Sync + 'static {
                     if Self::count() > 500 {
                         Self::rotate();
                     }
-                    write(&conn, response.to_string().as_bytes()).expect("Failed to write to socket");
+                    write(&conn, response.to_string().as_bytes())
+                        .expect("Failed to write to socket");
                     break;
                 }
                 Err(e) => {
@@ -280,6 +293,7 @@ trait Server: Send + Sync + 'static {
     fn run(this: Arc<Self>) {
         Self::init_config();
 
+        // Set empty handler for initial termination signal
         unsafe {
             let empty_handler = SigAction::new(
                 sys::signal::SigHandler::Handler(Self::ignore_term),
@@ -305,14 +319,16 @@ trait Server: Send + Sync + 'static {
             match accept(fd.as_raw_fd()) {
                 Ok(conn_fd) => {
                     let conn = unsafe { OwnedFd::from_raw_fd(conn_fd.as_raw_fd()) };
-                    let self_arc= Arc::clone(&this);
+                    let self_arc = Arc::clone(&this);
                     thread::spawn(move || {
                         self_arc.handle_connection(conn);
                     });
                 }
                 Err(e) => {
+                    // First termination signal received
                     if e == Errno::EINTR {
                         println!("\nNo longer accepting new connections, press Ctrl+C to exit");
+                        // Block signals until new handler is set up, wait for next termination signal
                         let mut set = sys::signal::SigSet::empty();
                         set.add(SIGINT);
                         set.add(SIGTERM);

@@ -68,7 +68,7 @@ impl Response {
         // Process the message and return a response
         let response = format!(
             "HTTP/1.1 {} {}\n\
-            {}\n\
+            Content-Type: {}\n\
             \n\
             {}\n",
             self.status, status_text, content_type, self.body
@@ -311,7 +311,10 @@ pub trait Server: Send + Sync + 'static {
             None,
         )
         .expect("Failed to create socket");
-        bind(fd.as_raw_fd(), &SockaddrIn::new(127, 0, 0, 1, 8080)).expect("Failed to bind socket");
+        match bind(fd.as_raw_fd(), &SockaddrIn::new(127, 0, 0, 1, 8080)) {
+            Err(_) => Self::handle_term(0),
+            _ => {}
+        }
 
         listen(&fd, Backlog::new(128).unwrap()).expect("Failed to listen on socket");
 

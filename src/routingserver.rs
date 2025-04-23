@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-
 use crate::server::{Method, Request, Response, Server};
 
 pub struct RoutingServer {
